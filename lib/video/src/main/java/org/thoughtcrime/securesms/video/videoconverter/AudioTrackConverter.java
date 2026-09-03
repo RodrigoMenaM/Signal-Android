@@ -38,18 +38,19 @@ final class AudioTrackConverter {
     final long mInputDuration;
 
     private final MediaExtractor mAudioExtractor;
+    private final MediaCodecInfo mAudioCodecInfo;
     private final MediaCodec mAudioDecoder;
-    private final MediaCodec mAudioEncoder;
+    private MediaCodec mAudioEncoder;
 
     private final ByteBuffer            instanceSampleBuffer = ByteBuffer.allocateDirect(SAMPLE_BUFFER_SIZE);
     private final MediaCodec.BufferInfo instanceBufferInfo   = new MediaCodec.BufferInfo();
 
     private final ByteBuffer[] mAudioDecoderInputBuffers;
     private ByteBuffer[] mAudioDecoderOutputBuffers;
-    private final ByteBuffer[] mAudioEncoderInputBuffers;
+    private ByteBuffer[] mAudioEncoderInputBuffers;
     private ByteBuffer[] mAudioEncoderOutputBuffers;
     private final MediaCodec.BufferInfo mAudioDecoderOutputBufferInfo;
-    private final MediaCodec.BufferInfo mAudioEncoderOutputBufferInfo;
+    private MediaCodec.BufferInfo mAudioEncoderOutputBufferInfo;
 
     MediaFormat mEncoderOutputAudioFormat;
 
@@ -99,13 +100,13 @@ final class AudioTrackConverter {
         mAudioExtractor = audioExtractor;
         mAudioBitrate = audioBitrate;
 
-        final MediaCodecInfo audioCodecInfo = MediaConverter.selectCodec(OUTPUT_AUDIO_MIME_TYPE);
-        if (audioCodecInfo == null) {
+        mAudioCodecInfo = MediaConverter.selectCodec(OUTPUT_AUDIO_MIME_TYPE);
+        if (mAudioCodecInfo == null) {
             // Don't fail CTS if they don't have an AAC codec (not here, anyway).
             Log.e(TAG, "Unable to find an appropriate codec for " + OUTPUT_AUDIO_MIME_TYPE);
             throw new FileNotFoundException();
         }
-        if (VERBOSE) Log.d(TAG, "audio found codec: " + audioCodecInfo.getName());
+        if (VERBOSE) Log.d(TAG, "audio found codec: " + mAudioCodecInfo.getName());
 
         final MediaFormat inputAudioFormat = mAudioExtractor.getTrackFormat(audioInputTrack);
         mInputDuration = inputAudioFormat.containsKey(MediaFormat.KEY_DURATION) ? inputAudioFormat.getLong(MediaFormat.KEY_DURATION) : 0;
@@ -117,27 +118,12 @@ final class AudioTrackConverter {
 
         if (VERBOSE) Log.d(TAG, "audio skipping transcoding: " + skipTrancode);
 
-        final MediaFormat outputAudioFormat =
-                MediaFormat.createAudioFormat(
-                        OUTPUT_AUDIO_MIME_TYPE,
-                        inputAudioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE),
-                        inputAudioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT));
-        outputAudioFormat.setInteger(MediaFormat.KEY_BIT_RATE, audioBitrate);
-        outputAudioFormat.setInteger(MediaFormat.KEY_AAC_PROFILE, OUTPUT_AUDIO_AAC_PROFILE);
-        outputAudioFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, SAMPLE_BUFFER_SIZE);
-
-        // Create a MediaCodec for the desired codec, then configure it as an encoder with
-        // our desired properties. Request a Surface to use for input.
-        mAudioEncoder = createAudioEncoder(audioCodecInfo, outputAudioFormat);
         // Create a MediaCodec for the decoder, based on the extractor's format.
         mAudioDecoder = createAudioDecoder(inputAudioFormat);
 
         mAudioDecoderInputBuffers = mAudioDecoder.getInputBuffers();
         mAudioDecoderOutputBuffers = mAudioDecoder.getOutputBuffers();
-        mAudioEncoderInputBuffers = mAudioEncoder.getInputBuffers();
-        mAudioEncoderOutputBuffers = mAudioEncoder.getOutputBuffers();
         mAudioDecoderOutputBufferInfo = new MediaCodec.BufferInfo();
-        mAudioEncoderOutputBufferInfo = new MediaCodec.BufferInfo();
 
         if (mTimeFrom > 0) {
             mAudioExtractor.seekTo(mTimeFrom * 1000, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
@@ -233,10 +219,16 @@ final class AudioTrackConverter {
                 break;
             }
             if (decoderOutputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                if (VERBOSE) {
-                    MediaFormat decoderOutputAudioFormat = mAudioDecoder.getOutputFormat();
-                    Log.d(TAG, "audio decoder: output format changed: " + decoderOutputAudioFormat);
-                }
+                Preconditions.checkState("audio decoder changed its output format again?", mAudioEncoder == null);
+
+                MediaFormat decoderOutputAudioFormat = mAudioDecoder.getOutputFormat();
+                if (VERBOSE) Log.d(TAG, "audio decoder: output format changed: " + decoderOutputAudioFormat);
+
+                MediaFormat encoderInputAudioFormat = createEncoderInputFormat(decoderOutputAudioFormat, mAudioBitrate);
+                mAudioEncoder = createAudioEncoder(mAudioCodecInfo, encoderInputAudioFormat);
+                mAudioEncoderInputBuffers = mAudioEncoder.getInputBuffers();
+                mAudioEncoderOutputBuffers = mAudioEncoder.getOutputBuffers();
+                mAudioEncoderOutputBufferInfo = new MediaCodec.BufferInfo();
                 break;
             }
             if (VERBOSE) {
@@ -266,7 +258,7 @@ final class AudioTrackConverter {
         }
 
         // Feed the pending decoded audio buffer to the audio encoder.
-        while (mPendingAudioDecoderOutputBufferIndex != -1) {
+        while (mPendingAudioDecoderOutputBufferIndex != -1 && mAudioEncoder != null) {
             if (VERBOSE) {
                 Log.d(TAG, "audio decoder: attempting to process pending buffer: " + mPendingAudioDecoderOutputBufferIndex);
             }
@@ -313,7 +305,7 @@ final class AudioTrackConverter {
         }
 
         // Poll frames from the audio encoder and send them to the muxer.
-        while (!mAudioEncoderDone && (mEncoderOutputAudioFormat == null || mMuxer != null)) {
+        while (mAudioEncoder != null && !mAudioEncoderDone && (mEncoderOutputAudioFormat == null || mMuxer != null)) {
             final int encoderOutputBufferIndex = mAudioEncoder.dequeueOutputBuffer(mAudioEncoderOutputBufferInfo, TIMEOUT_USEC);
             if (encoderOutputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 if (VERBOSE) Log.d(TAG, "no audio encoder output buffer");
@@ -466,6 +458,31 @@ final class AudioTrackConverter {
         encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
         encoder.start();
         return encoder;
+    }
+
+    /**
+     * AAC decoders can expose a different PCM format than the compressed track advertises. In
+     * particular, HE-AAC uses SBR and parametric stereo to expand a low-rate mono core into a
+     * higher-rate stereo output. The encoder consumes decoded PCM, so configuring it from the
+     * compressed input format makes it interpret the bytes at the wrong rate and channel count.
+     */
+    static @NonNull MediaFormat createEncoderInputFormat(final @NonNull MediaFormat decoderOutputFormat,
+                                                          final int audioBitrate) {
+        final MediaFormat encoderInputFormat = MediaFormat.createAudioFormat(
+                OUTPUT_AUDIO_MIME_TYPE,
+                decoderOutputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE),
+                decoderOutputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT));
+
+        encoderInputFormat.setInteger(MediaFormat.KEY_BIT_RATE, audioBitrate);
+        encoderInputFormat.setInteger(MediaFormat.KEY_AAC_PROFILE, OUTPUT_AUDIO_AAC_PROFILE);
+        encoderInputFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, SAMPLE_BUFFER_SIZE);
+
+        if (decoderOutputFormat.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
+            encoderInputFormat.setInteger(MediaFormat.KEY_PCM_ENCODING,
+                                          decoderOutputFormat.getInteger(MediaFormat.KEY_PCM_ENCODING));
+        }
+
+        return encoderInputFormat;
     }
 
     private static int getAndSelectAudioTrackIndex(MediaExtractor extractor) {
